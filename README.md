@@ -38,9 +38,12 @@ no rotate.
 ```bash
 pnpm install
 pnpm run deploy    # builds with opennextjs-cloudflare + wrangler deploy
-# or locally:
-pnpm run preview   # opennextjs-cloudflare build + wrangler dev
 ```
+
+**Local `wrangler dev` does not reproduce this bug** — see
+[Findings](#findings) below. You need a real deploy (or
+`wrangler dev --remote` against a configured zone) because the failure
+originates at the Cloudflare edge, upstream of `workerd`.
 
 Open the deployed URL. The page exposes two upload paths:
 
@@ -133,15 +136,65 @@ all four primitives succeed:
 The Workers body APIs and the multipart parser handle the Samsung bytes
 fine. Only the server-action dispatch path hangs.
 
-## Hypothesis
+## Findings
 
-The server-action client compiler produces a POST body whose fields
-include a `$ACTION_ID_<hash>` marker and numerically-prefixed argument
-keys. The dispatcher on the server decodes this before invoking the
-action. Somewhere in that decode path — either in OpenNext's adaptation
-of Next's server action handler, or inside Next's own `decodeReply` /
-`decodeAction` — one of the bytes in the Samsung scan data is
-misinterpreted in a way that awaits or loops forever.
+Deploying the repro and running the same tests against a real
+`workers.dev` URL (not `wrangler dev`) plus `wrangler tail`, produces
+this evidence:
+
+| Request | Worker received it? | Response |
+|---|---|---|
+| `POST /api/upload/probe` + **fail.jpg** | ✅ parsed cleanly | 200 |
+| `POST /` + form-submit shape (hidden `$ACTION_ID_<hash>` field) + **fail.jpg** | ✅ `[ACTION] entered`, `arrayBuffer bytes=2266615` | 200 |
+| `POST /` + `Next-Action: <hash>` header + **pass.jpg** | ✅ `[ACTION] entered` | 200 |
+| `POST /` + `Next-Action: <hash>` header + **fail.jpg** | **❌ never reached Worker** (no log line in tail) | **403 from `server: cloudflare`** |
+
+The 403 response body is Cloudflare's branded WAF challenge page
+(`<title>Attention Required! | Cloudflare</title>`, `Ray ID`,
+`cf-error-details`). The request is **blocked by a Cloudflare WAF
+managed rule at the edge**, upstream of `workerd`.
+
+**It is not a bug in OpenNext's or Next.js's server-action decoder.**
+The rule requires the combination of:
+
+1. A `Next-Action: <hash>` header (server-action dispatch path), **and**
+2. The specific byte sequence in the Samsung S22 Ultra JPEG scan data.
+
+Either ingredient alone passes:
+- fail.jpg bytes posted without `Next-Action` (form-submit shape, route
+  handler probe) reach the Worker fine.
+- pass.jpg bytes posted with `Next-Action` reach the Worker fine.
+
+Re-encoding the JPEG via macOS `sips` (pass.jpg) shifts the scan bytes
+past the WAF rule's signature.
+
+### Why it looks like a "hang" in the browser
+
+Next.js's RSC client reads the response as a flight stream. When
+Cloudflare returns a `text/html` challenge page instead, the flight
+parser waits for a marker that never arrives — indistinguishable from
+a hang until the client-side 30-second timer fires.
+
+### Why local `wrangler dev` does not reproduce
+
+Local `wrangler dev` runs `workerd` bound to loopback, with no
+Cloudflare edge in front of it. The blocking WAF rule never gets a
+chance to evaluate the request. `wrangler dev --remote` runs the Worker
+on the real edge but routes requests through a preview tunnel whose
+Host/Origin headers do not match what a deployed site sees, so you
+additionally have to deal with Next's server-action origin check before
+you can even exercise the WAF path. The fastest reliable repro is
+`pnpm run deploy` to a disposable `workers.dev` subdomain.
+
+### Fix for site owners
+
+In the Cloudflare dashboard → Security → Events, filter by the Ray ID
+from the 403 response to identify the exact managed rule, then either
+disable that rule for your zone or add a skip rule for server-action
+paths (Custom Rules: `http.request.uri.path eq "/..." and
+http.request.headers["next-action"] ne ""`).
+
+This is a WAF configuration change, not a code fix.
 
 ## License
 
