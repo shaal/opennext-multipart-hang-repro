@@ -50,18 +50,73 @@ Open the deployed URL. The page exposes two upload paths:
    body, four read primitives selectable via `?mode=`:
    `length` / `arraybuffer` / `stream` / `formdata`.
 
-### Expected output
+### Expected output — how to know the bug fired
 
-With `fixtures/fail.jpg`:
+The page makes the hang self-evident. After ~30 s of no response the client
+renders a red **"⚠️ HANG CONFIRMED"** banner. You do not need to stare at
+`wrangler tail` to know something went wrong — though tailing the backend
+is the cleanest confirmation of _why_.
 
-- **Path A (server action):** `POST /` arrives at Worker; middleware and
-  RSC render run; the action body's first `console.log('[ACTION] entered')`
-  **never fires**. The client `fetch` sits pending forever.
-- **Path B (route handler, all four modes):** HTTP 200 in <1 s, body parsed.
+#### Path A, `fixtures/fail.jpg` — **hang reproduces** (the bug)
 
-With `fixtures/pass.jpg`: both paths return 200 in ~350 ms.
+In-browser log:
 
-Observe with `wrangler tail` while triggering each path.
+```
+[client] server-action submit: name=fail.jpg size=2266615 type=image/jpeg
+[client] ...still waiting 5s
+[client] ...still waiting 10s
+[client] ...still waiting 15s
+[client] ...still waiting 20s
+[client] ...still waiting 25s
+[client] ⚠️  HANG CONFIRMED after 30001ms — server action never returned.
+[client]    wrangler tail should show: NO "[ACTION] entered" line.
+[client]    Re-run with fixtures/pass.jpg to confirm the path itself works.
+```
+
+Red banner renders on screen.
+
+`wrangler tail` shows the request **arriving** at the Worker but the action
+function never running:
+
+```
+POST https://<worker>.workers.dev/ - Ok
+  (middleware + RSC render logs, if any)
+  (NO "[ACTION] entered" line — that's the bug)
+```
+
+#### Path A, `fixtures/pass.jpg` — **action works** (control)
+
+In-browser log, in under 1 second:
+
+```
+[client] server-action submit: name=pass.jpg size=3927753 type=image/jpeg
+[client] ✓ server-action result (412ms): {"ok":true,"name":"pass.jpg","size":3927753,"bytes":3927753}
+```
+
+Green banner.
+
+`wrangler tail`:
+
+```
+POST https://<worker>.workers.dev/ - Ok
+  [ACTION] entered
+  [ACTION] file received: name=pass.jpg size=3927753 type=image/jpeg
+  [ACTION] arrayBuffer bytes=3927753
+```
+
+#### Path B (Route Handler) with either file — **works**
+
+Any of the four `?mode=` buttons on the page completes in <1 s for both
+fixtures. This is the bisection proof: the Workers body API and multipart
+parser handle the Samsung bytes fine; only the server-action dispatch
+layer hangs.
+
+### The point
+
+The difference between fail and pass is ~1.7 MB of re-encoded scan data.
+Nothing else — same filename-pattern, same multipart shape, same field
+name, same Worker, same deploy. Run both in the same browser session to
+eliminate any "maybe my network / deploy / build is broken" noise.
 
 ## Bisection table (from the upstream issue)
 

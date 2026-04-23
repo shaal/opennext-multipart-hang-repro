@@ -5,8 +5,17 @@ import { uploadViaAction } from "./actions";
 
 type LogLine = { ts: string; text: string };
 
+const HANG_TIMEOUT_MS = 30_000;
+
 export default function Home() {
   const [log, setLog] = useState<LogLine[]>([]);
+  const [status, setStatus] = useState<
+    | { kind: "idle" }
+    | { kind: "waiting"; startedAt: number; elapsed: number }
+    | { kind: "done"; ms: number }
+    | { kind: "error"; message: string }
+    | { kind: "hang"; ms: number }
+  >({ kind: "idle" });
   const fileRefAction = useRef<HTMLInputElement>(null);
   const fileRefProbe = useRef<HTMLInputElement>(null);
 
@@ -24,13 +33,47 @@ export default function Home() {
     const fd = new FormData();
     fd.set("original", f);
     const start = Date.now();
+    setStatus({ kind: "waiting", startedAt: start, elapsed: 0 });
+
+    // Visible countdown while we wait
+    const tick = setInterval(() => {
+      const elapsed = Date.now() - start;
+      setStatus({ kind: "waiting", startedAt: start, elapsed });
+      if (elapsed % 5000 < 250) {
+        append(`[client] ...still waiting ${Math.round(elapsed / 1000)}s`);
+      }
+    }, 250);
+
+    // Convert the silent hang into a loud positive event after 30s
+    const hangTimer = setTimeout(() => {
+      clearInterval(tick);
+      const ms = Date.now() - start;
+      setStatus({ kind: "hang", ms });
+      append(
+        `[client] ⚠️  HANG CONFIRMED after ${ms}ms — server action never returned.`,
+      );
+      append(
+        `[client]    wrangler tail should show: NO "[ACTION] entered" line.`,
+      );
+      append(
+        `[client]    Re-run with fixtures/pass.jpg to confirm the path itself works.`,
+      );
+    }, HANG_TIMEOUT_MS);
+
     try {
       const res = await uploadViaAction(fd);
+      clearInterval(tick);
+      clearTimeout(hangTimer);
+      const ms = Date.now() - start;
+      setStatus({ kind: "done", ms });
       append(
-        `[client] server-action result (${Date.now() - start}ms): ${JSON.stringify(res)}`,
+        `[client] ✓ server-action result (${ms}ms): ${JSON.stringify(res)}`,
       );
     } catch (err) {
-      append(`[client] server-action error: ${String(err)}`);
+      clearInterval(tick);
+      clearTimeout(hangTimer);
+      setStatus({ kind: "error", message: String(err) });
+      append(`[client] ✗ server-action error: ${String(err)}`);
     }
   }
 
@@ -83,6 +126,68 @@ export default function Home() {
             Submit via server action
           </button>
         </form>
+
+        {status.kind === "waiting" && (
+          <div
+            style={{
+              marginTop: 12,
+              padding: 10,
+              background: "#fff6d6",
+              border: "1px solid #d4b100",
+              borderRadius: 4,
+            }}
+          >
+            ⏳ Waiting for server action… elapsed{" "}
+            <strong>{Math.round(status.elapsed / 1000)}s</strong> / {" "}
+            {HANG_TIMEOUT_MS / 1000}s max
+          </div>
+        )}
+        {status.kind === "done" && (
+          <div
+            style={{
+              marginTop: 12,
+              padding: 10,
+              background: "#d6ffd6",
+              border: "1px solid #3aa03a",
+              borderRadius: 4,
+            }}
+          >
+            ✓ Server action returned in <strong>{status.ms}ms</strong>
+          </div>
+        )}
+        {status.kind === "hang" && (
+          <div
+            style={{
+              marginTop: 12,
+              padding: 10,
+              background: "#ffd6d6",
+              border: "2px solid #c41e1e",
+              borderRadius: 4,
+              color: "#7a0000",
+            }}
+          >
+            <strong>⚠️  HANG CONFIRMED</strong> — server action never returned
+            after {status.ms}ms.
+            <br />
+            Check <code>wrangler tail</code>: the action body's{" "}
+            <code>console.log("[ACTION] entered")</code> should be{" "}
+            <em>absent</em>. Re-run with <code>fixtures/pass.jpg</code> to
+            prove the path itself works.
+          </div>
+        )}
+        {status.kind === "error" && (
+          <div
+            style={{
+              marginTop: 12,
+              padding: 10,
+              background: "#ffd6d6",
+              border: "1px solid #c41e1e",
+              borderRadius: 4,
+            }}
+          >
+            ✗ Error: {status.message}
+          </div>
+        )}
       </fieldset>
 
       <fieldset style={{ marginTop: 16, padding: 16 }}>
